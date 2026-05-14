@@ -66,6 +66,34 @@ def _search_query_base(data_dict: dict[str, Any]) -> Query[Any]:
     return query
 
 
+def _resolve_group_ids(values: list[str]) -> list[str]:
+    if not values:
+        return []
+    rows = (
+        model.Session.query(model.Group.id)
+        .filter(
+            or_(
+                model.Group.id.in_(values),
+                model.Group.name.in_(values),
+                model.Group.title.in_(values),
+            )
+        )
+        .all()
+    )
+    return [group_id for (group_id,) in rows]
+
+
+def _resolve_tag_ids(values: list[str]) -> list[str]:
+    if not values:
+        return []
+    rows = (
+        model.Session.query(model.Tag.id)
+        .filter(or_(model.Tag.id.in_(values), model.Tag.name.in_(values)))
+        .all()
+    )
+    return [tag_id for (tag_id,) in rows]
+
+
 def _apply_text_search(
     query: Query[Any], text_query: str
 ) -> tuple[Query[Any], Optional[Any]]:
@@ -204,6 +232,240 @@ def _extract_filter_clauses(data_dict: dict[str, Any]) -> list[tuple[str, list[s
     return clauses
 
 
+def _apply_supported_filter_clauses(
+    query: Query[Any], clauses: list[tuple[str, list[str]]]
+) -> tuple[Query[Any], list[tuple[str, list[str]]]]:
+    unsupported: list[tuple[str, list[str]]] = []
+
+    for field, values in clauses:
+        if not values:
+            continue
+
+        if field in {"dataset_type", "type"}:
+            query = query.filter(model.Package.type.in_(values))
+            continue
+
+        if field == "owner_org":
+            group_ids = _resolve_group_ids(values)
+            if group_ids:
+                query = query.filter(model.Package.owner_org.in_(group_ids))
+            else:
+                query = query.filter(model.Package.owner_org.in_(values))
+            continue
+
+        if field == "organization":
+            group_ids = _resolve_group_ids(values)
+            query = query.filter(model.Package.owner_org.in_(group_ids or [""]))
+            continue
+
+        if field == "groups":
+            group_ids = _resolve_group_ids(values)
+            subquery = (
+                model.Session.query(model.Member.table_id)
+                .filter(model.Member.table_name == "package")
+                .filter(model.Member.state == "active")
+                .filter(model.Member.group_id.in_(group_ids or [""]))
+            )
+            query = query.filter(model.Package.id.in_(subquery))
+            continue
+
+        if field == "tags":
+            tag_ids = _resolve_tag_ids(values)
+            subquery = (
+                model.Session.query(model.PackageTag.package_id)
+                .filter(model.PackageTag.state == "active")
+                .filter(model.PackageTag.tag_id.in_(tag_ids or [""]))
+            )
+            query = query.filter(model.Package.id.in_(subquery))
+            continue
+
+        if field == "license_id":
+            query = query.filter(model.Package.license_id.in_(values))
+            continue
+
+        if field == "id":
+            query = query.filter(model.Package.id.in_(values))
+            continue
+
+        if field == "name":
+            query = query.filter(model.Package.name.in_(values))
+            continue
+
+        unsupported.append((field, values))
+
+    return query, unsupported
+
+
+def _query_count(query: Query[Any]) -> int:
+    return query.with_entities(model.Package.id).order_by(None).count()
+
+
+def _query_package_ids(query: Query[Any], start: int = 0, rows: Optional[int] = None) -> list[str]:
+    if start:
+        query = query.offset(start)
+    if rows is not None:
+        query = query.limit(rows)
+    return [row[0] for row in query.all()]
+
+
+def _group_dataset_counts(group_ids: list[str], *, is_org: bool) -> dict[str, int]:
+    if not group_ids:
+        return {}
+
+    count_query = (
+        model.Session.query(model.Member.group_id, func.count(model.Package.id))
+        .join(
+            model.Package,
+            model.Member.table_id == model.Package.id,
+        )
+        .filter(model.Member.table_name == "package")
+        .filter(model.Member.state == "active")
+        .filter(model.Package.state == "active")
+        .filter(model.Package.type == "dataset")
+        .filter(model.Package.private.is_(False))
+        .filter(model.Member.group_id.in_(group_ids))
+        .group_by(model.Member.group_id)
+    )
+
+    counts = {group_id: count for group_id, count in count_query.all()}
+    return {
+        group_id: counts.get(group_id, 0)
+        for group_id in group_ids
+    }
+
+
+def _parse_group_sort(sort: str) -> tuple[str, str]:
+    sort = (sort or config.get("ckan.default_group_sort") or "title asc").strip()
+    if sort in {"packages", "package_count"}:
+        sort = "package_count desc"
+
+    parts = sort.replace(",", " ").split()
+    field = parts[0] if parts else "title"
+    direction = parts[1].lower() if len(parts) > 1 else "asc"
+
+    if field not in {"name", "packages", "package_count", "title"}:
+        raise toolkit.ValidationError({"message": f"Cannot sort by field `{field}`"})
+    if direction not in {"asc", "desc"}:
+        raise toolkit.ValidationError({"message": f"Invalid sort direction `{direction}`"})
+
+    if field == "packages":
+        field = "package_count"
+    return field, direction
+
+
+def _group_or_org_list(
+    context: dict[str, Any], data_dict: dict[str, Any], *, is_org: bool = False
+) -> list[Any]:
+    toolkit.check_access("organization_list" if is_org else "group_list", context, data_dict)
+
+    group_type = data_dict.get("type") or ("organization" if is_org else "group")
+    api_version = context.get("api_version")
+    ref_group_by = "id" if api_version == 2 else "name"
+    groups_filter = data_dict.get("groups") or []
+    q = (data_dict.get("q") or "").strip()
+    all_fields = _asbool(data_dict.get("all_fields"))
+
+    try:
+        max_limit = int(
+            config.get(
+                "ckan.group_and_organization_list_all_fields_max"
+                if all_fields
+                else "ckan.group_and_organization_list_max"
+            )
+        )
+    except (TypeError, ValueError):
+        max_limit = 25 if all_fields else 1000
+
+    raw_limit = data_dict.get("limit")
+    limit = max_limit if raw_limit is None else min(int(raw_limit), max_limit)
+    offset = int(data_dict.get("offset") or 0)
+
+    sort_field, sort_direction = _parse_group_sort(
+        data_dict.get("sort") or data_dict.get("order_by") or ""
+    )
+
+    dataset_counts_sq = (
+        model.Session.query(
+            model.Member.group_id.label("group_id"),
+            func.count(model.Package.id).label("package_count"),
+        )
+        .join(model.Package, model.Member.table_id == model.Package.id)
+        .filter(model.Member.table_name == "package")
+        .filter(model.Member.state == "active")
+        .filter(model.Package.state == "active")
+        .filter(model.Package.type == "dataset")
+        .filter(model.Package.private.is_(False))
+        .group_by(model.Member.group_id)
+        .subquery()
+    )
+
+    package_count = func.coalesce(dataset_counts_sq.c.package_count, 0)
+    query = (
+        model.Session.query(model.Group)
+        .outerjoin(dataset_counts_sq, dataset_counts_sq.c.group_id == model.Group.id)
+        .filter(model.Group.state == "active")
+        .filter(model.Group.is_organization == is_org)
+        .filter(model.Group.type == group_type)
+    )
+
+    if groups_filter:
+        group_names = groups_filter
+        if isinstance(groups_filter, str):
+            group_names = [name.strip() for name in groups_filter.split(",") if name.strip()]
+        query = query.filter(model.Group.name.in_(group_names))
+
+    if q:
+        like_q = f"%{q}%"
+        query = query.filter(
+            or_(
+                model.Group.name.ilike(like_q),
+                model.Group.title.ilike(like_q),
+                model.Group.description.ilike(like_q),
+            )
+        )
+
+    sort_column = {
+        "name": model.Group.name,
+        "title": model.Group.title,
+        "package_count": package_count,
+    }[sort_field]
+    if sort_direction == "asc":
+        query = query.order_by(asc(sort_column), asc(model.Group.name))
+    else:
+        query = query.order_by(desc(sort_column), asc(model.Group.name))
+
+    query = query.offset(offset).limit(limit)
+    groups = query.all()
+
+    if not all_fields:
+        return [getattr(group, ref_group_by) for group in groups]
+
+    include_dataset_count = _asbool(data_dict.get("include_dataset_count"), default=True)
+    include_datasets = _asbool(data_dict.get("include_datasets"))
+    show_context = dict(context)
+    if include_dataset_count and not include_datasets:
+        count_map = _group_dataset_counts([group.id for group in groups], is_org=is_org)
+        show_context["dataset_counts"] = {
+            "owner_org" if is_org else "groups": count_map,
+        }
+
+    action = toolkit.get_action("organization_show" if is_org else "group_show")
+    group_list = []
+    for group in groups:
+        show_data = dict(data_dict)
+        show_data["id"] = group.id
+        for key in (
+            "include_extras",
+            "include_tags",
+            "include_users",
+            "include_groups",
+            "include_followers",
+        ):
+            show_data.setdefault(key, False)
+        group_list.append(action(show_context, show_data))
+    return group_list
+
+
 def _field_values(pkg_dict: dict[str, Any], field: str) -> list[str]:
     if field == "groups":
         return [
@@ -324,39 +586,42 @@ class PostgresPackageSearchQuery(SearchQuery):
         db_query = _search_query_base(
             {"include_private": False, "include_deleted": False, "include_drafts": False}
         )
+        filter_clauses = _extract_filter_clauses(query)
+        db_query, unsupported_clauses = _apply_supported_filter_clauses(db_query, filter_clauses)
         db_query, rank_column = _apply_text_search(db_query, text_query)
         if rank_column is not None:
             db_query = db_query.add_columns(rank_column)
         db_query = _apply_sort(db_query, query, rank_column)
 
+        start = int(query.get("start", 0) or 0)
         rows = int(query.get("rows", 10))
-        package_ids = [row[0] for row in db_query.all()]
+        self.count = _query_count(db_query)
+
+        package_ids = _query_package_ids(db_query, start=start, rows=rows)
         package_dicts = _postgres_package_dicts(package_ids)
 
-        filter_clauses = _extract_filter_clauses(query)
-        if filter_clauses:
+        if unsupported_clauses:
             package_dicts = [
                 pkg_dict
                 for pkg_dict in package_dicts
-                if _matches_filter_clauses(pkg_dict, filter_clauses)
+                if _matches_filter_clauses(pkg_dict, unsupported_clauses)
             ]
 
-        self.count = len(package_dicts)
         facet_fields = _normalize_facet_fields(query.get("facet.field"))
-        self.facets = _facet_counts(package_dicts, facet_fields)
+        self.facets = {} if not facet_fields else _facet_counts(package_dicts, facet_fields)
 
         result_fields = _split_result_field_list(query.get("fl"))
         results: list[Any]
         if result_fields:
             results = []
-            for pkg_dict in package_dicts[:rows]:
+            for pkg_dict in package_dicts:
                 result = {field: pkg_dict.get(field) for field in result_fields}
                 if len(result_fields) == 1 and result_fields[0] in {"id", "name"}:
                     results.append(result.get(result_fields[0]))
                 else:
                     results.append(result)
         else:
-            results = package_dicts[:rows]
+            results = package_dicts
 
         self.results = results
         return {"results": self.results, "count": self.count}
@@ -392,27 +657,27 @@ def package_search(context: dict[str, Any], data_dict: dict[str, Any]) -> dict[s
     fl = _split_result_field_list(data_dict.get("fl"))
 
     query = _search_query_base(data_dict)
+    filter_clauses = _extract_filter_clauses(data_dict)
+    query, unsupported_clauses = _apply_supported_filter_clauses(query, filter_clauses)
     query, rank_column = _apply_text_search(query, text_query)
     if rank_column is not None:
         query = query.add_columns(rank_column)
     query = _apply_sort(query, data_dict, rank_column)
 
-    raw_rows = query.all()
-    package_ids = [row[0] for row in raw_rows]
+    total_count = _query_count(query)
+    package_ids = _query_package_ids(query, start=start, rows=rows)
     visible_results = _iter_visible_results(context, package_ids, fl=fl)
-    filter_clauses = _extract_filter_clauses(data_dict)
-    if filter_clauses:
+    if unsupported_clauses:
         visible_results = [
             result
             for result in visible_results
-            if _matches_filter_clauses(result, filter_clauses)
+            if _matches_filter_clauses(result, unsupported_clauses)
         ]
 
-    paged_results = visible_results[start:start + rows]
     search_results = {
-        "count": len(visible_results),
+        "count": total_count,
         "facets": {},
-        "results": paged_results,
+        "results": visible_results,
         "sort": data_dict.get("sort") or config.get("ckan.search.default_package_sort"),
         "search_facets": {},
     }
@@ -476,6 +741,21 @@ def package_autocomplete(context: dict[str, Any], data_dict: dict[str, Any]) -> 
     return output
 
 
+def organization_list(context: dict[str, Any], data_dict: dict[str, Any]) -> list[Any]:
+    data_dict = dict(data_dict)
+    data_dict["groups"] = data_dict.pop("organizations", [])
+    data_dict.setdefault("type", "organization")
+    return _group_or_org_list(context, data_dict, is_org=True)
+
+
+def group_list(context: dict[str, Any], data_dict: dict[str, Any]) -> list[Any]:
+    return _group_or_org_list(context, dict(data_dict), is_org=False)
+
+
+organization_list.side_effect_free = True
+group_list.side_effect_free = True
+
+
 class PsqlsearchPlugin(plugins.SingletonPlugin):
     plugins.implements(plugins.IConfigurer)
     plugins.implements(plugins.IActions)
@@ -498,4 +778,6 @@ class PsqlsearchPlugin(plugins.SingletonPlugin):
         return {
             "package_search": package_search,
             "package_autocomplete": package_autocomplete,
+            "organization_list": organization_list,
+            "group_list": group_list,
         }
