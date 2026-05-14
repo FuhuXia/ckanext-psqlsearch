@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Iterable, Optional
 
 from sqlalchemy import asc, cast, desc, func, or_, String
@@ -293,7 +294,7 @@ class PostgresPackageSearchQuery(SearchQuery):
 
     def get_index(self, reference: str) -> dict[str, Any]:
         show_action = toolkit.get_action("package_show")
-        return show_action(
+        pkg_dict = show_action(
             {
                 "model": model,
                 "session": model.Session,
@@ -303,6 +304,14 @@ class PostgresPackageSearchQuery(SearchQuery):
             },
             {"id": reference},
         )
+        metadata_modified = pkg_dict.get("metadata_modified")
+        return {
+            "id": pkg_dict.get("id"),
+            "name": pkg_dict.get("name"),
+            "metadata_modified": metadata_modified,
+            "data_dict": json.dumps(pkg_dict),
+            "validated_data_dict": json.dumps(pkg_dict),
+        }
 
     def run(
         self,
