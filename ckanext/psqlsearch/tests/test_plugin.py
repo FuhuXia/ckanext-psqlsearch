@@ -1,4 +1,5 @@
 import pytest
+from types import SimpleNamespace
 
 from ckan.plugins import plugin_loaded
 import ckan.plugins as plugins
@@ -101,7 +102,7 @@ def test_package_search_returns_api_action_shape(monkeypatch):
         lambda context, package_ids, fl=None: [{"id": "dataset-1", "name": "dataset-1"}],
     )
     monkeypatch.setattr(plugin, "has_request_context", lambda: True)
-    monkeypatch.setattr(plugin.request, "path", "/api/action/package_search", raising=False)
+    monkeypatch.setattr(plugin, "request", SimpleNamespace(path="/api/action/package_search"))
 
     result = plugin.package_search({}, data_dict)
 

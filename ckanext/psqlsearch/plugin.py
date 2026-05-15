@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable, Optional
 
 from flask import has_request_context, request
@@ -223,14 +224,11 @@ def _extract_filter_clauses(data_dict: dict[str, Any]) -> list[tuple[str, list[s
         raw_filters.append(data_dict["fq"])
     raw_filters.extend(data_dict.get("fq_list", []))
 
+    token_pattern = re.compile(r'(?:(?<=\s)|^)\+?([A-Za-z_][\w]*)\:((?:\([^)]*\)|"[^"]*"|[^\s]+))')
+
     for raw_filter in raw_filters:
-        for token in str(raw_filter).split():
-            token = token.strip()
-            if not token or ":" not in token:
-                continue
-            if token.startswith("+"):
-                token = token[1:]
-            field, raw_value = token.split(":", 1)
+        for match in token_pattern.finditer(str(raw_filter)):
+            field, raw_value = match.groups()
             if field in {"site_id", "state", "capacity", "permission_labels"}:
                 continue
             clauses.append((field, _normalize_fq_values(raw_value)))

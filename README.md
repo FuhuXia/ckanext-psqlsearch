@@ -68,6 +68,18 @@ pip install -r dev-requirements.txt
 
 ## Tests
 
+To run the same test flow locally that GitHub Actions uses:
+
+```bash
+./scripts/run-tests-docker.sh
+```
+
+This uses [docker-compose.test.yml](/Users/fxia/git/ckanext-psqlsearch/docker-compose.test.yml)
+to start the same CKAN, PostgreSQL, Redis, and Solr image set used in CI, then
+installs the extension and runs pytest inside `ckan/ckan-dev:2.11`.
+
+If you already have a compatible CKAN test environment, you can still run:
+
 ```bash
 pytest --ckan-ini=test.ini
 ```
